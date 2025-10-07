@@ -1,0 +1,139 @@
+function [eqs, names, types, state] = equationsWaterGasMech(p0, sW0, state0, ...
+                                                            p, sW, wellVars, ...
+                                                            state, model, ...
+                                                            dt, mechTerm, ...
+                                                            drivingForces, varargin)
+% Equations for water-gas flow with mechanical effects on porosity.
+
+    % Extract optional parameters
+    opt = struct('iteration', -1, ...
+                 'resOnly', false);
+    opt = merge_options(opt, varargin{:});
+
+    % Extract model properties
+    W  = drivingForces.W;
+    s  = model.operators;
+    f  = model.fluid;
+    G  = model.G;
+    rock = model.rock;
+
+    % Compute gas saturation
+    sG = 1 - sW;
+
+    % Compute relative permeability
+    [krW, krG] = model.evaluateRelPerm({sW, sG});
+
+    % Compute multipliers for porosity and transmissibility
+    trMult = 1;
+    if isfield(f, 'tranMultR'), trMult = f.tranMultR(p); end;
+
+    pvMult = 1; pvMult0 = 1;
+    if isfield(f, 'pvMultR')
+        pvMult  = f.pvMultR(p);
+        pvMult0 = f.pvMultR(p0);
+    end
+
+    transMult = 1;
+    if isfield(f, 'transMult')
+        transMult = f.transMult(p);
+    end
+
+    trans = s.T .* transMult;
+
+    % Capillary pressure
+    pcWG = 0;
+    if isfield(f, 'pcWG')
+        pcWG = f.pcWG(sG);
+    end
+
+    % Compute fluxes, mobilities, densities
+    [bW, mobW, fluxW, vW, upcw] = compMFlux(p       , f.bW, f.muW, f.rhoWS, trMult, krW, s, trans, model);
+    [bG, mobG, fluxG, vG, upcg] = compMFlux(p + pcWG, f.bG, f.muG, f.rhoGS, trMult, krG, s, trans, model);
+
+    % Compute densities at previous time step
+    bW0 = f.bW(p0);
+    bG0 = f.bG(p0 + pcWG);
+
+    % ----------------------------------------------------------------------------
+    % **Mechanical Effects on Porosity**
+    % Compute effective pore volume considering mechanical changes
+    effPorVol  = rock.poro .* (G.cells.volumes .* pvMult)  + rock.alpha .* mechTerm.new;
+    effPorVol0 = rock.poro .* (G.cells.volumes .* pvMult0) + rock.alpha .* mechTerm.old;
+
+    % ----------------------------------------------------------------------------
+    % **Modified Mass Conservation Equations**
+    
+    % Conservation of mass for water (updated with effective porosity)
+    water = (1/dt) * (effPorVol .* bW .* sW - effPorVol0 .* bW0 .* sW0) + s.Div(fluxW);
+    
+    % Conservation of mass for gas (updated with effective porosity)
+    gas = (1/dt) * (effPorVol .* bG .* sG - effPorVol0 .* bG0 .* (1 - sW0)) + s.Div(fluxG);
+
+    eqs = {water, gas};  % List of residual equations
+    names = {'water', 'gas'};  % Equation names
+    types = {'cell', 'cell'};  % Equation types (cell-based mass balance)
+    
+    % ----------------------------------------------------------------------------
+    % **Boundary Conditions & Flux Storage**
+    
+    if model.outputFluxes
+        state = model.storeFluxes(state, vW, [], vG);
+    end
+    if model.extraStateOutput
+        state = model.storebfactors(state, bW, [], bG);
+        state = model.storeMobilities(state, mobW, [], mobG);
+        state = model.storeUpstreamIndices(state, upcw, [], upcg);
+    end
+    
+    rho = {bW.*f.rhoWS, bG.*f.rhoGS};
+    mob = {mobW, mobG};
+    sat = {sW, sG};
+
+    if ~isempty(drivingForces.bc) && isempty(drivingForces.bc.sat)
+       drivingForces.bc.sat = repmat([1 0], numel(drivingForces.bc.face), 1);
+    end
+
+    [eqs, state] = addBoundaryConditionsAndSources(model, eqs, names, types, state, ...
+                                                                     {p, p + pcWG}, sat, mob, rho, ...
+                                                                     {}, {}, ...
+                                                                     drivingForces);
+
+    % ----------------------------------------------------------------------------
+    % **Well Equations**
+
+
+    wellSol = model.getProp(state, 'wellsol');
+
+    [~, wellVarNames, wellMap] = model.FacilityModel.getAllPrimaryVariables(wellSol);
+
+    wellSol0 = model.getProp(state0, 'wellsol');
+
+    [eqs, names, types, state.wellSol] = model.insertWellEquations(eqs, names, types, ...
+                                                      wellSol0, wellSol, ...
+                                                      wellVars, wellMap, p, ...
+                                                      mob, rho, {}, {}, dt, opt);
+end
+
+% ============================= END MAIN FUNCTION =============================
+
+% ----------------------------------------------------------------------------
+function [b, mob, fluxS, fluxR, upc] = compMFlux(p, bfun, mufun, rhoS, trMult, kr, s, trans, model)
+    if all(isfinite(model.t))
+        b   = bfun(p, model.t);
+        mob = trMult .* kr ./ mufun(p, model.t);
+    else
+        b   = bfun(p);
+        mob = trMult .* kr ./ mufun(p);
+    end
+
+    rhoFace = s.faceAvg(b*rhoS);
+    
+    dp   = s.Grad(p) - rhoFace .* model.getGravityGradient();
+    upc  = (value(dp)<=0);
+    fluxR = -s.faceUpstr(upc, mob) .* trans .* dp;
+    fluxS = s.faceUpstr(upc, b) .* fluxR;
+end
+
+
+
+
